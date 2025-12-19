@@ -1,6 +1,6 @@
 name: meme_maker
-version: 1.2.0
+version: 1.2.1
 author: flash_back__
 description: 图片合成梗图生成器
 main_file: main.py
-repo: ""
+repo: "https://github.com/dionaka/meme_maker"

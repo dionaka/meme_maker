@@ -11,6 +11,7 @@ import aiohttp
 import os
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
 
 @register("meme_maker", "Your Name", "图片合成梗图生成器", "1.0.0", "")
 class MemeMakerPlugin(Star):
@@ -26,8 +27,11 @@ class MemeMakerPlugin(Star):
         # HTTP会话复用（避免频繁创建和销毁）
         self.http_session = None
         
-        # 线程池用于执行CPU密集型任务
-        self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="meme_maker")
+        # 线程池用于执行CPU密集型任务（根据CPU核心数动态设置，至少2个，最多8个）
+        cpu_count = multiprocessing.cpu_count()
+        max_workers = max(2, min(cpu_count, 8))
+        self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="meme_maker")
+        logger.info(f"[梗图] 线程池已创建，工作线程数: {max_workers} (CPU核心数: {cpu_count})")
         
         # 模板1路径（原有模板）
         self.template_path = Path(__file__).parent / "template.png"
@@ -94,18 +98,20 @@ class MemeMakerPlugin(Star):
         except Exception as e:
             logger.error(f"[梗图] ❌ Haar级联模型加载失败: {e}")
         
-        # 预加载圣诞帽图片
+        # 预加载圣诞帽图片（使用cv2.imdecode支持Unicode路径，解决Windows中文路径问题）
         if self.hat_path.exists():
             try:
-                self.hat_img = cv2.imread(str(self.hat_path), cv2.IMREAD_UNCHANGED)
+                # 使用np.fromfile + cv2.imdecode读取，支持Unicode路径（Windows中文路径兼容）
+                img_array = np.fromfile(str(self.hat_path), dtype=np.uint8)
+                self.hat_img = cv2.imdecode(img_array, cv2.IMREAD_UNCHANGED)
                 if self.hat_img is None:
-                    logger.error(f"[梗图] ❌ 圣诞帽图片加载失败（文件可能损坏）")
+                    logger.error(f"[梗图] ❌ 圣诞帽图片加载失败（文件可能损坏或格式不支持）")
                     self.hat_img = None
                 elif len(self.hat_img.shape) < 3 or self.hat_img.shape[2] != 4:
                     logger.error(f"[梗图] ❌ 圣诞帽图片不包含Alpha通道，需要RGBA格式的PNG图片")
                     self.hat_img = None
                 else:
-                    logger.info(f"[梗图] ✅ 圣诞帽图片加载成功")
+                    logger.info(f"[梗图] ✅ 圣诞帽图片加载成功（支持Unicode路径）")
             except Exception as e:
                 logger.error(f"[梗图] ❌ 圣诞帽图片加载失败: {e}")
                 self.hat_img = None
@@ -174,6 +180,140 @@ class MemeMakerPlugin(Star):
         logger.info(f"[梗图] 用户 {user_id} 开始梗图制作流程（模式：add2，圣诞帽）")
         yield event.plain_result("🎅 请发送一张包含人脸的图片，我将为他/她戴上圣诞帽！")
 
+    def _extract_images_from_message(self, message) -> list:
+        """
+        从消息中提取图片对象
+        返回图片对象列表
+        """
+        images = []
+        for idx, seg in enumerate(message):
+            if isinstance(seg, Image):
+                images.append(seg)
+                logger.info(f"[梗图] 找到图片消息段 {idx}")
+            elif hasattr(seg, 'type') and seg.type == "image":
+                images.append(seg)
+                logger.info(f"[梗图] 找到图片消息段 {idx} (通过type)")
+        return images
+    
+    async def _download_image_from_url(self, url: str) -> bytes:
+        """
+        从URL下载图片
+        返回图片字节数据，失败返回None
+        """
+        try:
+            logger.info(f"[梗图] 尝试从 URL 下载: {url}")
+            async with self.http_session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status == 200:
+                    content_length = resp.headers.get('Content-Length')
+                    if content_length:
+                        try:
+                            file_size_mb = int(content_length) / 1024 / 1024
+                            logger.info(f"[梗图] 检测到文件大小: {file_size_mb:.2f}MB，将下载并处理")
+                        except (ValueError, TypeError):
+                            pass
+                    image_data = await resp.read()
+                    if not image_data:
+                        raise ValueError("下载的图片数据为空")
+                    logger.info(f"[梗图] URL 下载成功: {len(image_data)} 字节 ({len(image_data) / 1024 / 1024:.2f}MB)")
+                    return image_data
+                else:
+                    logger.warn(f"[梗图] URL下载失败，HTTP状态码: {resp.status}")
+                    return None
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.error(f"[梗图] URL下载异常: {e}")
+            return None
+    
+    def _read_image_from_file(self, file_path: str) -> bytes:
+        """
+        从本地文件读取图片
+        返回图片字节数据，失败返回None
+        """
+        try:
+            logger.info(f"[梗图] 尝试从文件读取: {file_path}")
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"文件不存在: {file_path}")
+            file_size = os.path.getsize(file_path)
+            file_size_mb = file_size / 1024 / 1024
+            logger.info(f"[梗图] 检测到文件大小: {file_size_mb:.2f}MB，将读取并处理")
+            with open(file_path, 'rb') as f:
+                image_data = f.read()
+                if not image_data:
+                    raise ValueError("读取的图片数据为空")
+                logger.info(f"[梗图] 文件读取成功: {len(image_data)} 字节 ({len(image_data) / 1024 / 1024:.2f}MB)")
+                return image_data
+        except (OSError, IOError, FileNotFoundError) as e:
+            logger.error(f"[梗图] 文件读取异常: {e}")
+            return None
+    
+    async def _download_or_read_image(self, image_seg) -> bytes:
+        """
+        从图片对象中下载或读取图片数据
+        支持多种来源：url, file, path, data.url, data.file
+        返回图片字节数据，失败返回None
+        """
+        # 优先级：url > file > path > data.url > data.file
+        if hasattr(image_seg, 'url') and image_seg.url:
+            return await self._download_image_from_url(image_seg.url)
+        
+        elif hasattr(image_seg, 'file') and image_seg.file:
+            return self._read_image_from_file(image_seg.file)
+        
+        elif hasattr(image_seg, 'path') and image_seg.path:
+            return self._read_image_from_file(image_seg.path)
+        
+        elif hasattr(image_seg, 'data'):
+            if hasattr(image_seg.data, 'url') and image_seg.data.url:
+                return await self._download_image_from_url(image_seg.data.url)
+            elif hasattr(image_seg.data, 'file') and image_seg.data.file:
+                return self._read_image_from_file(image_seg.data.file)
+        
+        return None
+    
+    def _validate_image_data(self, image_data: bytes) -> bool:
+        """
+        验证图片数据的有效性（检查尺寸等）
+        返回True表示有效，False表示无效（但不会拒绝处理）
+        """
+        temp_img = None
+        try:
+            temp_img = PILImage.open(io.BytesIO(image_data))
+            temp_img.verify()  # 验证图片完整性
+            temp_img.close()  # 关闭第一次打开的图片
+            temp_img = PILImage.open(io.BytesIO(image_data))  # 重新打开（verify后需要重新打开）
+            img_width, img_height = temp_img.size
+            
+            MAX_DIMENSION = 2000
+            if max(img_width, img_height) > MAX_DIMENSION:
+                logger.info(f"[梗图] 检测到图片尺寸较大 ({img_width}x{img_height})，将在处理时自动缩小到合理尺寸")
+            return True
+        except Exception as size_check_e:
+            logger.warn(f"[梗图] 图片尺寸检查失败，继续处理: {size_check_e}")
+            return False
+        finally:
+            if temp_img:
+                try:
+                    temp_img.close()
+                except:
+                    pass
+    
+    async def _process_image_by_mode(self, image_data: bytes, mode: str, user_id: str) -> bytes:
+        """
+        根据模式处理图片
+        返回处理后的图片数据
+        """
+        if mode == 'add':
+            if not self.template_path.exists():
+                raise FileNotFoundError(f"模板1不存在: {self.template_path}")
+            return await self.process_image_mode1(image_data)
+        elif mode == 'add1':
+            if not self.template2_path.exists():
+                raise FileNotFoundError(f"模板2不存在: {self.template2_path}")
+            return await self.process_image_mode2(image_data)
+        elif mode == 'add2':
+            return await self.process_image_mode3(image_data)
+        else:
+            raise ValueError(f"未知的处理模式: {mode}")
+    
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
         """监听所有消息，处理图片"""
@@ -193,14 +333,7 @@ class MemeMakerPlugin(Star):
         logger.info(f"[梗图] 用户 {user_id} 在等待列表中，开始检查消息")
         
         # 提取图片消息
-        images = []
-        for idx, seg in enumerate(event.message_obj.message):
-            if isinstance(seg, Image):
-                images.append(seg)
-                logger.info(f"[梗图] 找到图片消息段 {idx}")
-            elif hasattr(seg, 'type') and seg.type == "image":
-                images.append(seg)
-                logger.info(f"[梗图] 找到图片消息段 {idx} (通过type)")
+        images = self._extract_images_from_message(event.message_obj.message)
         
         if not images:
             logger.info(f"[梗图] 用户 {user_id} 发送的消息中没有图片，继续等待")
@@ -212,106 +345,8 @@ class MemeMakerPlugin(Star):
             # 获取第一张图片
             image_seg = images[0]
             
-            # 下载图片数据
-            image_data = None
-            file_size_mb = 0
-            
-            if hasattr(image_seg, 'url') and image_seg.url:
-                logger.info(f"[梗图] 尝试从 URL 下载: {image_seg.url}")
-                try:
-                    async with self.http_session.get(image_seg.url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                        if resp.status == 200:
-                            # 🔥 记录文件大小，但不限制（只要图片尺寸被限制，大文件也能快速处理）
-                            content_length = resp.headers.get('Content-Length')
-                            if content_length:
-                                try:
-                                    file_size_mb = int(content_length) / 1024 / 1024
-                                    logger.info(f"[梗图] 检测到文件大小: {file_size_mb:.2f}MB，将下载并处理")
-                                except (ValueError, TypeError):
-                                    pass
-                            image_data = await resp.read()
-                            if not image_data:
-                                raise ValueError("下载的图片数据为空")
-                            logger.info(f"[梗图] URL 下载成功: {len(image_data)} 字节 ({len(image_data) / 1024 / 1024:.2f}MB)")
-                        else:
-                            logger.warn(f"[梗图] URL下载失败，HTTP状态码: {resp.status}")
-                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    logger.error(f"[梗图] URL下载异常: {e}")
-                    image_data = None
-            
-            elif hasattr(image_seg, 'file') and image_seg.file:
-                logger.info(f"[梗图] 尝试从 file 读取: {image_seg.file}")
-                try:
-                    if not os.path.exists(image_seg.file):
-                        raise FileNotFoundError(f"文件不存在: {image_seg.file}")
-                    file_size = os.path.getsize(image_seg.file)
-                    file_size_mb = file_size / 1024 / 1024
-                    logger.info(f"[梗图] 检测到文件大小: {file_size_mb:.2f}MB，将读取并处理")
-                    with open(image_seg.file, 'rb') as f:
-                        image_data = f.read()
-                        if not image_data:
-                            raise ValueError("读取的图片数据为空")
-                        logger.info(f"[梗图] file 读取成功: {len(image_data)} 字节 ({len(image_data) / 1024 / 1024:.2f}MB)")
-                except (OSError, IOError, FileNotFoundError) as e:
-                    logger.error(f"[梗图] file读取异常: {e}")
-                    image_data = None
-            
-            elif hasattr(image_seg, 'path') and image_seg.path:
-                logger.info(f"[梗图] 尝试从 path 读取: {image_seg.path}")
-                try:
-                    if not os.path.exists(image_seg.path):
-                        raise FileNotFoundError(f"文件不存在: {image_seg.path}")
-                    file_size = os.path.getsize(image_seg.path)
-                    file_size_mb = file_size / 1024 / 1024
-                    logger.info(f"[梗图] 检测到文件大小: {file_size_mb:.2f}MB，将读取并处理")
-                    with open(image_seg.path, 'rb') as f:
-                        image_data = f.read()
-                        if not image_data:
-                            raise ValueError("读取的图片数据为空")
-                        logger.info(f"[梗图] path 读取成功: {len(image_data)} 字节 ({len(image_data) / 1024 / 1024:.2f}MB)")
-                except (OSError, IOError, FileNotFoundError) as e:
-                    logger.error(f"[梗图] path读取异常: {e}")
-                    image_data = None
-            
-            elif hasattr(image_seg, 'data'):
-                if hasattr(image_seg.data, 'url') and image_seg.data.url:
-                    logger.info(f"[梗图] 尝试从 data.url 下载: {image_seg.data.url}")
-                    try:
-                        async with self.http_session.get(image_seg.data.url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                            if resp.status == 200:
-                                # 🔥 记录文件大小，但不限制
-                                content_length = resp.headers.get('Content-Length')
-                                if content_length:
-                                    try:
-                                        file_size_mb = int(content_length) / 1024 / 1024
-                                        logger.info(f"[梗图] 检测到文件大小: {file_size_mb:.2f}MB，将下载并处理")
-                                    except (ValueError, TypeError):
-                                        pass
-                                image_data = await resp.read()
-                                if not image_data:
-                                    raise ValueError("下载的图片数据为空")
-                                logger.info(f"[梗图] data.url 下载成功: {len(image_data)} 字节 ({len(image_data) / 1024 / 1024:.2f}MB)")
-                            else:
-                                logger.warn(f"[梗图] data.url下载失败，HTTP状态码: {resp.status}")
-                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                        logger.error(f"[梗图] data.url下载异常: {e}")
-                        image_data = None
-                elif hasattr(image_seg.data, 'file') and image_seg.data.file:
-                    logger.info(f"[梗图] 尝试从 data.file 读取: {image_seg.data.file}")
-                    try:
-                        if not os.path.exists(image_seg.data.file):
-                            raise FileNotFoundError(f"文件不存在: {image_seg.data.file}")
-                        file_size = os.path.getsize(image_seg.data.file)
-                        file_size_mb = file_size / 1024 / 1024
-                        logger.info(f"[梗图] 检测到文件大小: {file_size_mb:.2f}MB，将读取并处理")
-                        with open(image_seg.data.file, 'rb') as f:
-                            image_data = f.read()
-                            if not image_data:
-                                raise ValueError("读取的图片数据为空")
-                            logger.info(f"[梗图] data.file 读取成功: {len(image_data)} 字节 ({len(image_data) / 1024 / 1024:.2f}MB)")
-                    except (OSError, IOError, FileNotFoundError) as e:
-                        logger.error(f"[梗图] data.file读取异常: {e}")
-                        image_data = None
+            # 下载或读取图片数据
+            image_data = await self._download_or_read_image(image_seg)
             
             if not image_data:
                 # 只输出关键属性，避免输出整个dir()列表
@@ -326,31 +361,12 @@ class MemeMakerPlugin(Star):
                 del self.waiting_users[user_id]
                 return
             
-            # 🔥 注意：不限制文件大小，但会限制图片尺寸（像素），确保处理速度
-            # 只要图片尺寸被限制在2000像素以内，即使文件很大也能快速处理
+            # 记录文件大小
             file_size_mb = len(image_data) / 1024 / 1024
             logger.info(f"[梗图] 开始处理图片，文件大小: {len(image_data)} 字节 ({file_size_mb:.2f}MB)")
             
-            # 🔥 提前检查图片尺寸（仅用于日志记录，不拒绝处理）
-            temp_img = None
-            try:
-                temp_img = PILImage.open(io.BytesIO(image_data))
-                temp_img.verify()  # 验证图片完整性
-                temp_img.close()  # 关闭第一次打开的图片
-                temp_img = PILImage.open(io.BytesIO(image_data))  # 重新打开（verify后需要重新打开）
-                img_width, img_height = temp_img.size
-                
-                MAX_DIMENSION = 2000
-                if max(img_width, img_height) > MAX_DIMENSION:
-                    logger.info(f"[梗图] 检测到图片尺寸较大 ({img_width}x{img_height})，将在处理时自动缩小到合理尺寸")
-            except Exception as size_check_e:
-                logger.warn(f"[梗图] 图片尺寸检查失败，继续处理: {size_check_e}")
-            finally:
-                if temp_img:
-                    try:
-                        temp_img.close()
-                    except:
-                        pass
+            # 验证图片数据（仅用于日志记录，不拒绝处理）
+            self._validate_image_data(image_data)
             
             # 获取用户模式（再次检查，防止在处理过程中被删除）
             if user_id not in self.waiting_users:
@@ -363,25 +379,14 @@ class MemeMakerPlugin(Star):
                 yield event.plain_result("❌ 处理失败：模式信息缺失")
                 return
             
-            # 根据模式选择处理方法
-            if mode == 'add':
-                # 检查模板1是否存在
-                if not self.template_path.exists():
-                    logger.error(f"[梗图] 模板1不存在: {self.template_path}")
-                    yield event.plain_result(f"❌ 模板图片不存在\n路径: {self.template_path}")
-                    del self.waiting_users[user_id]
-                    return
-                result_image_data = await self.process_image_mode1(image_data)
-            elif mode == 'add1':  # mode == 'add1'
-                # 检查模板2是否存在
-                if not self.template2_path.exists():
-                    logger.error(f"[梗图] 模板2不存在: {self.template2_path}")
-                    yield event.plain_result(f"❌ 模板图片不存在\n路径: {self.template2_path}")
-                    del self.waiting_users[user_id]
-                    return
-                result_image_data = await self.process_image_mode2(image_data)
-            else:  # mode == 'add2'
-                result_image_data = await self.process_image_mode3(image_data)
+            # 根据模式处理图片
+            try:
+                result_image_data = await self._process_image_by_mode(image_data, mode, user_id)
+            except FileNotFoundError as e:
+                logger.error(f"[梗图] {e}")
+                yield event.plain_result(f"❌ 模板图片不存在\n路径: {e}")
+                del self.waiting_users[user_id]
+                return
             
             # 检查处理结果
             if not result_image_data or len(result_image_data) == 0:
@@ -394,13 +399,10 @@ class MemeMakerPlugin(Star):
             logger.info(f"[梗图] 已清除用户 {user_id} 的等待状态")
             
             # 返回处理后的图片
-            # 🔥 避免输出图片数据到控制台，只记录大小
             result_size_mb = len(result_image_data) / 1024 / 1024
             logger.info(f"[梗图] 图片处理完成，结果大小: {len(result_image_data)} 字节 ({result_size_mb:.2f}MB)，准备发送")
             
-            # 创建图片对象（框架可能会输出，但我们已经限制了日志）
-            if not result_image_data or len(result_image_data) == 0:
-                raise ValueError("处理后的图片数据为空")
+            # 创建图片对象
             try:
                 result_image = Image.fromBytes(result_image_data)
                 yield event.chain_result([Plain("✅ 梗图生成完成！\n"), result_image])

@@ -1,5 +1,5 @@
 name: astrbot_plugin_meme_maker
-version: 1.2.2
+version: 1.2.1
 author: flash_back__
 description: 图片合成梗图生成器
 main_file: main.py
